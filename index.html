@@ -2862,7 +2862,10 @@ function playEvent(ctx, dest, song, e, t, sd){
 /* --- じっこう エンジン --- */
 const KEY = 'flatCreaturesAudio';
 let cfg = {bgm:true, sfx:true, vol:0.6, sfxVol:0.7};
-try { Object.assign(cfg, JSON.parse(localStorage.getItem(KEY) || '{}')); } catch(e){}
+try { const sv = JSON.parse(localStorage.getItem(KEY) || '{}'); if (sv && typeof sv === 'object') Object.assign(cfg, sv); } catch(e){}
+const num01 = (v, d) => (typeof v === 'number' && isFinite(v)) ? Math.max(0, Math.min(1, v)) : d;
+cfg.vol = num01(cfg.vol, 0.6); cfg.sfxVol = num01(cfg.sfxVol, 0.7);
+if (typeof cfg.bgm !== 'boolean') cfg.bgm = true; if (typeof cfg.sfx !== 'boolean') cfg.sfx = true;
 const AU = {ctx:null, ok:false, unlocked:false, want:null, cur:null, pinch:false, cfg};
 const built = {};
 const getSong = n => built[n] || (built[n] = build(n));
@@ -2870,16 +2873,19 @@ function ensureCtx(){
   if (AU.ctx) return AU.ctx;
   const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return null;
   try {
-    const ctx = new AC(), comp = ctx.createDynamicsCompressor(), master = ctx.createGain();
-    comp.threshold.value = -14; comp.ratio.value = 4; comp.attack.value = 0.003; comp.release.value = 0.2;
-    master.connect(comp); comp.connect(ctx.destination);
+    let ctx; try { ctx = new AC({latencyHint:'interactive'}); } catch(e){ ctx = new AC(); }
+    const master = ctx.createGain(); let out = master;
+    try { const comp = ctx.createDynamicsCompressor(); comp.threshold.value = -14; comp.ratio.value = 4; comp.attack.value = 0.003; comp.release.value = 0.2; master.connect(comp); out = comp; } catch(e){}
+    try { const an = ctx.createAnalyser(); an.fftSize = 512; out.connect(an); an.connect(ctx.destination); AU.analyser = an; } catch(e){ out.connect(ctx.destination); }
+    try { ctx.onstatechange = onState; } catch(e){}
     AU.music = ctx.createGain(); AU.sfxBus = ctx.createGain(); AU.music.connect(master); AU.sfxBus.connect(master);
     AU.ctx = ctx; AU.master = master; AU.ok = true; applyVol();
   } catch(e){ AU.ok = false; AU.ctx = null; }
   return AU.ctx;
 }
-function applyVol(){ if (!AU.ok) return; const t = AU.ctx.currentTime;
-  AU.music.gain.setTargetAtTime(cfg.bgm ? cfg.vol*0.9 : 0, t, 0.05); AU.sfxBus.gain.setTargetAtTime(cfg.sfx ? cfg.sfxVol : 0, t, 0.02); }
+function setG(p, v, tc){ v = isFinite(v) ? v : 0; try { p.cancelScheduledValues(AU.ctx.currentTime); p.setTargetAtTime(v, AU.ctx.currentTime, tc); } catch(e){ try { p.value = v; } catch(e2){} } }
+function applyVol(){ if (!AU.ok) return;
+  setG(AU.music.gain, cfg.bgm ? cfg.vol*0.9 : 0, 0.05); setG(AU.sfxBus.gain, cfg.sfx ? cfg.sfxVol : 0, 0.02); }
 function saveCfg(){ try { localStorage.setItem(KEY, JSON.stringify(cfg)); } catch(e){} applyVol(); if (cfg.bgm && AU.want && !AU.cur) startSong(AU.want); }
 function stopSong(){
   if (!AU.cur) return; const c = AU.cur; AU.cur = null; clearInterval(c.timer);
@@ -2895,11 +2901,13 @@ function startSong(name){
 function tick(c){
   if (AU.cur !== c || AU.ctx.state !== 'running') return;
   const ctx = AU.ctx;
+  if (c.next < ctx.currentTime - 0.25) c.next = ctx.currentTime + 0.05; // バックグラウンドから もどった とき まとめて ならさない
   try {
-    while (c.next < ctx.currentTime + 0.15){
+    let guard = 0;
+    while (c.next < ctx.currentTime + 0.15 && guard++ < 64){
       const sec = c.song.sections[c.sec];
       const sd = 60/c.song.bpm/4 / ((AU.pinch && (c.name==='battle'||c.name==='champion')) ? 1.12 : 1);
-      sec.ev[c.step].forEach(e => playEvent(ctx, c.bus, c.name, e, c.next, sd));
+      sec.ev[c.step].forEach(e => { try { playEvent(ctx, c.bus, c.name, e, c.next, sd); } catch(err){} });
       if (AU.pinch && (c.name==='battle'||c.name==='champion') && c.step%4===2) tone(ctx, c.bus, 0.125, 1760, c.next, 0.04, 0.025);
       c.next += sd; c.step++;
       if (c.step >= sec.steps){
@@ -3019,19 +3027,67 @@ AU.sfx = (k, arg) => {
 };
 AU.SFX = SFX;
 
-/* はじめての タップで おとを ゆるす */
-function unlock(){
-  if (AU.unlocked) return;
-  if (!ensureCtx()) return;
-  AU.unlocked = true;
-  try { AU.ctx.resume(); } catch(e){}
-  if (AU.want) startSong(AU.want);
+/* タップで おとを ゆるす（iPhone / Android 対策：タップの たびに running に なるまで やりなおす） */
+const running = () => !!(AU.ctx && AU.ctx.state === 'running');
+let tagEl = null;
+function silentUrl(){ // 0.25びょうの むおん WAV
+  const n = 2000, dv = new DataView(new ArrayBuffer(44+n));
+  const ws = (o, x) => { for (let i = 0; i < x.length; i++) dv.setUint8(o+i, x.charCodeAt(i)); };
+  ws(0,'RIFF'); dv.setUint32(4,36+n,true); ws(8,'WAVEfmt '); dv.setUint32(16,16,true); dv.setUint16(20,1,true); dv.setUint16(22,1,true);
+  dv.setUint32(24,8000,true); dv.setUint32(28,8000,true); dv.setUint16(32,1,true); dv.setUint16(34,8,true); ws(36,'data'); dv.setUint32(40,n,true);
+  for (let i = 0; i < n; i++) dv.setUint8(44+i, 128);
+  try { return URL.createObjectURL(new Blob([dv.buffer], {type:'audio/wav'})); } catch(e){ return ''; }
 }
-['pointerdown','touchend','click','keydown'].forEach(ev => document.addEventListener(ev, unlock, {capture:true, passive:true}));
+function playTag(){ // iPhone の サイレントスイッチ でも ならす ための むおん <audio>
+  try {
+    if (!tagEl){ tagEl = document.createElement('audio'); tagEl.setAttribute('playsinline',''); tagEl.setAttribute('webkit-playsinline',''); tagEl.loop = true; tagEl.preload = 'auto'; tagEl.src = silentUrl(); tagEl.style.display = 'none'; document.body.appendChild(tagEl); }
+    if (tagEl.paused && (cfg.bgm || cfg.sfx)){ const p = tagEl.play(); if (p && p.catch) p.catch(() => {}); }
+  } catch(e){}
+}
+function setSession(){ try { if (navigator.audioSession && navigator.audioSession.type !== 'playback') navigator.audioSession.type = 'playback'; } catch(e){} }
+function onState(){
+  updateHint();
+  if (!running()) return;
+  if (AU.cur) AU.cur.next = Math.max(AU.cur.next, AU.ctx.currentTime + 0.05);
+  else if (AU.want && cfg.bgm) startSong(AU.want);
+}
+function unlock(){
+  if (running() && (!(cfg.bgm || cfg.sfx) || (tagEl && !tagEl.paused))) return;
+  setSession();
+  const ctx = ensureCtx(); if (!ctx) return;
+  AU.unlocked = true;
+  try { const b = ctx.createBuffer(1, 1, ctx.sampleRate || 44100), src = ctx.createBufferSource(); src.buffer = b; src.connect(ctx.destination); if (src.start) src.start(0); else src.noteOn(0); } catch(e){}
+  if (ctx.state !== 'running'){ try { const p = ctx.resume(); if (p && p.then) p.then(onState, () => {}); } catch(e){} }
+  playTag();
+  onState();
+}
+AU.unlock = unlock;
+['touchend','click','pointerup','keydown','pointerdown','touchstart'].forEach(ev => document.addEventListener(ev, unlock, {capture:true, passive:true}));
+function wake(){ if (!AU.ok || document.hidden) return; try { if (AU.ctx.state !== 'running' && AU.unlocked){ const p = AU.ctx.resume(); if (p && p.then) p.then(onState, () => {}); } } catch(e){} if (AU.unlocked) playTag(); }
 document.addEventListener('visibilitychange', () => {
   if (!AU.ok) return;
-  try { if (document.hidden) AU.ctx.suspend(); else if (AU.unlocked) AU.ctx.resume().then(() => { if (AU.cur) AU.cur.next = Math.max(AU.cur.next, AU.ctx.currentTime+0.05); }); } catch(e){}
+  if (document.hidden){ try { AU.ctx.suspend(); } catch(e){} try { if (tagEl) tagEl.pause(); } catch(e){} }
+  else wake();
 });
+window.addEventListener('pageshow', wake); window.addEventListener('focus', wake);
+window.addEventListener('pagehide', () => { try { if (AU.ok) AU.ctx.suspend(); if (tagEl) tagEl.pause(); } catch(e){} });
+/* おとが でていない ときの ヒント */
+let hintEl = null;
+function updateHint(){
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    const need = !!AC && (cfg.bgm || cfg.sfx) && !running() && !document.hidden;
+    if (!hintEl){ if (!need) return; hintEl = document.createElement('div'); hintEl.id = 'sndhint'; hintEl.textContent = '🔇 タップで おとが でます';
+      hintEl.style.cssText = 'position:fixed;left:50%;transform:translateX(-50%);top:calc(12px + env(safe-area-inset-top));z-index:60;background:rgba(58,51,85,.88);color:#fff;font-weight:800;font-size:13px;padding:7px 14px;border-radius:999px;pointer-events:none;box-shadow:0 2px 6px rgba(0,0,0,.2)';
+      document.body.appendChild(hintEl); }
+    hintEl.style.display = need ? 'block' : 'none';
+    const st = document.getElementById('snd-state'); if (st) st.textContent = stateText();
+  } catch(e){}
+}
+const stateText = () => !(window.AudioContext || window.webkitAudioContext) ? 'この ブラウザは おとに たいおう していません' : running() ? '🔊 おと：OK（ならせる じょうたい）' : '🔇 おと：まだ とまっています（がめんを タップしてね）';
+AU.level = () => { try { const an = AU.analyser, d = new Float32Array(an.fftSize); an.getFloatTimeDomainData(d); let m = 0; for (const v of d) m = Math.max(m, Math.abs(v)); return m; } catch(e){ return -1; } };
+AU.state = () => AU.ctx ? AU.ctx.state : 'none';
+setTimeout(updateHint, 1200);
 /* オフライン レンダリング（プレビュー用） */
 function toWav(buf){
   const sr = buf.sampleRate, L = buf.getChannelData(0), n = L.length, dv = new DataView(new ArrayBuffer(44+n*2));
@@ -3071,16 +3127,19 @@ function openSound(){
     <div class="sndrow"><span>こうかおん</span><button class="sndtg ${cfg.sfx?'on':''}" id="snd-sfx">${cfg.sfx?'ON':'OFF'}</button></div>
     <div class="sndrow"><span>BGMの おおきさ</span><input type="range" id="snd-vol" min="0" max="100" value="${Math.round(cfg.vol*100)}"></div>
     <div class="sndrow"><span>こうかおんの おおきさ</span><input type="range" id="snd-svol" min="0" max="100" value="${Math.round(cfg.sfxVol*100)}"></div>
-    <div style="font-size:11px;opacity:.7;margin:6px 0 10px">おとは がめんを タップすると はじまるよ。</div>
+    <div class="sndrow" style="flex-wrap:wrap;gap:6px"><span id="snd-state" style="font-size:12px">${stateText()}</span><button class="sndtg on" id="snd-test" style="background:#ff8a5c">おとの テスト</button></div>
+    <div style="font-size:11px;opacity:.75;margin:6px 0 10px;line-height:1.5">おとは がめんを タップすると はじまるよ。<br>きこえない ときは：スマホの おんりょうボタンで おおきく する／iPhone は よこの マナーモード（サイレント）スイッチを オフに する／ほかの アプリの おとを とめる、を ためしてね。</div>
     <button class="btn" id="snd-close">とじる</button>`;
   $('#modal').classList.add('show');
   const upd = () => { $('#snd-bgm').className = 'sndtg'+(cfg.bgm?' on':''); $('#snd-bgm').textContent = cfg.bgm?'ON':'OFF'; $('#snd-sfx').className = 'sndtg'+(cfg.sfx?' on':''); $('#snd-sfx').textContent = cfg.sfx?'ON':'OFF'; document.querySelectorAll('.sndbtn').forEach(b => b.textContent = (cfg.bgm||cfg.sfx) ? '🔊' : '🔇'); };
-  $('#snd-bgm').onclick = () => { cfg.bgm = !cfg.bgm; saveCfg(); if (!cfg.bgm) stopSong(); upd(); };
+  $('#snd-bgm').onclick = () => { cfg.bgm = !cfg.bgm; saveCfg(); if (!cfg.bgm) stopSong(); upd(); updateHint(); };
   $('#snd-sfx').onclick = () => { cfg.sfx = !cfg.sfx; saveCfg(); upd(); AU.sfx('tap'); };
   $('#snd-vol').oninput = e => { cfg.vol = e.target.value/100; saveCfg(); };
   $('#snd-svol').oninput = e => { cfg.sfxVol = e.target.value/100; saveCfg(); };
   $('#snd-svol').onchange = () => AU.sfx('hit');
   $('#snd-close').onclick = () => $('#modal').classList.remove('show');
+  $('#snd-test').onclick = () => { unlock(); const go = () => { AU.sfx('connect'); setTimeout(() => AU.sfx('super'), 450); updateHint(); };
+    if (running()) go(); else { try { AU.ctx && AU.ctx.resume().then(go, () => {}); } catch(e){} } setTimeout(updateHint, 300); };
 }
 function addBtn(parent, cls){ const b = document.createElement('button'); b.className = 'sndbtn '+cls; b.textContent = (cfg.bgm||cfg.sfx) ? '🔊' : '🔇'; b.setAttribute('aria-label','サウンド せってい'); b.onclick = e => { e.stopPropagation(); openSound(); }; parent.appendChild(b); }
 try { addBtn($('#s-title'), 't'); addBtn($('#field'), 'f'); } catch(e){}
