@@ -2,7 +2,7 @@
 
 スマホで あそべる オリジナル モンスターバトル（1ファイルの HTML ゲーム）。
 
-▶ あそぶ: https://ryowatanabe1161-svg.github.io/flat-creatures/
+▶ あそぶ: https://fuusan-games.github.io/flat-creatures/
 
 - 127たいの オリジナル クリーチャー（しんか しない「たんたい」「くせつよ」も）、わざ 220しゅ・とくせい 72しゅ、CPU バトル、ずかん
 - オリジナル チップチューン BGM・こうかおん（Web Audio で その場で 合成、🔊で ON/OFF・BGM／こうかおん べつべつの おんりょう）
